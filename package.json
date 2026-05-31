@@ -1,0 +1,13 @@
+{
+  "name": "render-media-proxy",
+  "version": "1.0.0",
+  "description": "Unrestricted streaming video bypass proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "express": "^4.19.2"
+  }
+}
