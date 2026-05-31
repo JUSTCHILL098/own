@@ -1,4 +1,3 @@
-// Universal Edge Runtime Configuration
 export const config = {
   runtime: 'edge', 
 };
@@ -13,9 +12,9 @@ function corsHeaders() {
   };
 }
 
-function browserHeaders(referer) {
-  return {
-    'User-Agent':         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+function browserHeaders(referer, origin, customUA) {
+  const h = {
+    'User-Agent':         customUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept':             '*/*',
     'Accept-Language':    'en-US,en;q=0.9',
     'Accept-Encoding':    'gzip, deflate, br',
@@ -23,8 +22,10 @@ function browserHeaders(referer) {
     'Sec-Fetch-Mode':     'cors',
     'Sec-Fetch-Site':     'cross-site',
     'Connection':         'keep-alive',
-    'Referer':            referer,
   };
+  if (referer) h['Referer'] = referer;
+  if (origin)  h['Origin']  = origin;
+  return h;
 }
 
 function resolveUrl(relativeUrl, baseUrl) {
@@ -32,27 +33,35 @@ function resolveUrl(relativeUrl, baseUrl) {
   try { return new URL(relativeUrl, baseUrl).href; } catch { return relativeUrl; }
 }
 
-function rewriteM3u8(text, baseUrl, workerOrigin) {
+/* ─── Smart Playlist Stream Rewriter ─────────────────────────────────────── */
+function rewriteM3u8(text, baseUrl, referer, origin, ua, workerOrigin) {
   const lines = text.split('\n');
+  
+  // Build the parameters string dynamically to pass headers down to individual chunks
+  let paramSuffix = `&ref=${encodeURIComponent(referer)}`;
+  if (origin) paramSuffix += `&orig=${encodeURIComponent(origin)}`;
+  if (ua) paramSuffix += `&ua=${encodeURIComponent(ua)}`;
+
   return lines.map(raw => {
     const line = raw.trim();
 
     if (line.startsWith('#') && line.includes('URI="')) {
       return line.replace(/URI="([^"]+)"/g, (_, uri) => {
         const absUrl = resolveUrl(uri, baseUrl);
-        return `URI="${workerOrigin}/api/proxy?url=${encodeURIComponent(absUrl)}"`;
+        return `URI="${workerOrigin}/api/proxy?url=${encodeURIComponent(absUrl)}${paramSuffix}"`;
       });
     }
 
     if (line && !line.startsWith('#')) {
       const absUrl = resolveUrl(line, baseUrl);
-      return `${workerOrigin}/api/proxy?url=${encodeURIComponent(absUrl)}`;
+      return `${workerOrigin}/api/proxy?url=${encodeURIComponent(absUrl)}${paramSuffix}`;
     }
 
     return raw;
   }).join('\n');
 }
 
+/* ─── Request Handler ────────────────────────────────────────────────────── */
 export default async function handler(request) {
   const urlObj = new URL(request.url);
 
@@ -62,20 +71,24 @@ export default async function handler(request) {
 
   const targetUrl = urlObj.searchParams.get('url');
   if (!targetUrl) {
-    return new Response(JSON.stringify({ error: "Missing '?url=' parameter" }), {
+    return new Response(JSON.stringify({ error: "Missing required parameter '?url='" }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
   }
 
-  // Enforce the verified working Kwik referer for owocdn/uwucdn domains
-  let effectiveReferer = "https://kwik.cx/";
-  if (!targetUrl.includes('owocdn') && !targetUrl.includes('uwucdn')) {
-    const customRef = urlObj.searchParams.get('ref');
-    effectiveReferer = customRef || `https://${new URL(targetUrl).hostname}/`;
+  /* ─── Extract Dynamic Header Mappings ─── */
+  let referer = urlObj.searchParams.get('ref') || '';
+  let origin = urlObj.searchParams.get('orig') || '';
+  let ua = urlObj.searchParams.get('ua') || '';
+
+  // AUTOMATED SAFETY: If targeting owocdn/uwucdn and referer isn't explicitly set right, force kwik.cx
+  if ((targetUrl.includes('owocdn.top') || targetUrl.includes('uwucdn.top')) && (!referer || referer.includes('miruro'))) {
+    referer = 'https://kwik.cx';
   }
 
-  const headers = browserHeaders(effectiveReferer);
+  const headers = browserHeaders(referer, origin, ua);
+  
   const rangeHeader = request.headers.get('Range');
   if (rangeHeader) headers['Range'] = rangeHeader;
 
@@ -87,14 +100,18 @@ export default async function handler(request) {
       redirect: 'follow',
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: "Upstream connection dropped", detail: String(err) }), {
+    return new Response(JSON.stringify({ error: "Upstream dispatch failed", detail: String(err) }), {
       status: 502,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
   }
 
   if (!upstreamResponse.ok && upstreamResponse.status !== 206) {
-    return new Response(JSON.stringify({ error: "Upstream server rejected handshake", status: upstreamResponse.status }), {
+    return new Response(JSON.stringify({ 
+      error: "Upstream server rejected proxy payload", 
+      status: upstreamResponse.status,
+      attemptedReferer: referer
+    }), {
       status: upstreamResponse.status,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
@@ -112,7 +129,7 @@ export default async function handler(request) {
 
   if (isM3u8Manifest) {
     const textData = await upstreamResponse.text();
-    const rewrittenManifest = rewriteM3u8(textData, targetUrl, urlObj.origin);
+    const rewrittenManifest = rewriteM3u8(textData, targetUrl, referer, origin, ua, urlObj.origin);
     return new Response(rewrittenManifest, {
       status: upstreamResponse.status,
       headers: {
